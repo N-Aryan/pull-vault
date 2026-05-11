@@ -1,6 +1,8 @@
 # PullVault
+Live Demo: https://pull-vault-production.up.railway.app
 
 Pokemon TCG pack-ripping + peer-to-peer trading + live auctions. Work-trial submission.
+Focus: transactional consistency, concurrency safety, realtime updates, and marketplace economics.
 
 ## Stack
 
@@ -33,6 +35,31 @@ npm run db:seed
 npm run dev
 # → http://localhost:3000
 ```
+## Screenshots
+
+<img width="1512" height="857" alt="Pack Drops page" src="https://github.com/user-attachments/assets/2ff6f21c-72cb-41a2-953c-9bebbbd0278e" />
+<img width="1512" height="862" alt="Collection" src="https://github.com/user-attachments/assets/306df5da-4816-488a-b73e-a82d71be48f2" />
+<img width="1512" height="860" alt="Marketplace" src="https://github.com/user-attachments/assets/74087c1f-e050-4b89-b765-6353d7856991" />
+<img width="1512" height="857" alt="Auction" src="https://github.com/user-attachments/assets/2afdef4e-488b-4044-8fea-f6909611bafe" />
+<img width="1512" height="860" alt="Admin Economics dashboard" src="https://github.com/user-attachments/assets/fc63a61b-6c07-43a4-8a11-1325b4bb7543" />
+
+
+## High-level architecture
+
+```text
+Client (Next.js App Router)
+        ↓
+REST APIs + Socket.io server
+        ↓
+Transactional service layer
+(pack-engine / market-engine / auction-engine)
+        ↓
+PostgreSQL (source of truth)
+        ↓
+Redis pub/sub + worker loops
+(real-time bids, drops, price ticks)
+```
+
 
 ## Project layout
 
@@ -59,6 +86,17 @@ src/
     └── workers.ts           # auction-closer + price-tick + drop-launcher loops
 ```
 
+## Key engineering decisions
+
+- Money stored as BIGINT cents to avoid floating-point drift.
+- PostgreSQL is the source of truth for all inventory and balance state.
+- Redis is used only for ephemeral realtime fan-out and worker coordination.
+- Conditional SQL UPDATE patterns prevent double-spends and duplicate purchases.
+- Auction settlement runs in transactional boundaries to preserve consistency.
+- Socket.io pushes live updates without polling.
+- Retry-on-serialization-failure logic (`40001`) protects concurrent writes.
+
+  
 ## Scope cuts (be honest about these in the review)
 
 - **Auth** is email/password only — no social login, no email verification.
@@ -81,8 +119,6 @@ src/
 
 1. [ARCHITECTURE.md](./ARCHITECTURE.md) — schema, concurrency strategy,
    pack EV math, parameter justification, scaling failure modes.
-2. [INTERVIEW_PREP.md](./INTERVIEW_PREP.md) — every question they're likely
-   to ask in the review call, with the exact code references.
 
 ## Demoing concurrency in two tabs
 

@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+html, body { background: #0b0d12; color: #e7e9ee; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: 0.55; }
+.card-shadow { box-shadow: 0 6px 20px rgba(0,0,0,0.45); }
+.rarity-common { color: #9ca3af; }
+.rarity-uncommon { color: #34d399; }
+.rarity-rare { color: #60a5fa; }
+.rarity-holo { color: #c084fc; }
+.rarity-ultra { color: #f59e0b; }
+.rarity-secret { color: #f43f5e; }

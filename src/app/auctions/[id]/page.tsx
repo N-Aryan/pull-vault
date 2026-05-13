@@ -44,6 +44,9 @@ export default function AuctionRoom({ params }: { params: { id: string } }) {
 
   if (!a) return <div>Loading auction…</div>;
 
+  const inSealed: boolean = !!a.in_sealed_phase;
+  // In sealed phase we don't know the current high. Use start_price as the
+  // floor — bidders must place at least that.
   const cur = a.current_bid_cents ? Number(a.current_bid_cents) : Number(a.start_price_cents);
   const minNext = a.current_bid_cents
     ? Math.max(Math.ceil(cur * 1.05), cur + Number(a.min_increment_cents || 100))
@@ -77,9 +80,15 @@ export default function AuctionRoom({ params }: { params: { id: string } }) {
       </div>
       <div className="space-y-3">
         <div className="rounded-lg border border-border bg-panel p-4">
-          <div className="text-xs text-zinc-500">Current bid</div>
-          <div className="text-3xl font-bold">${(cur / 100).toFixed(2)}</div>
-          <div className="text-xs text-zinc-500 mt-1">{a.current_bidder_id ? `by ${a.current_bidder_id.slice(0, 8)}…` : "no bids yet"}</div>
+          <div className="text-xs text-zinc-500">{inSealed ? "Sealed phase — current bid hidden" : "Current bid"}</div>
+          <div className="text-3xl font-bold">
+            {inSealed ? "🔒 ???" : `$${(cur / 100).toFixed(2)}`}
+          </div>
+          <div className="text-xs text-zinc-500 mt-1">
+            {inSealed
+              ? "Bidders cannot see each other — commit your max bid blindly"
+              : (a.current_bidder_id ? `by ${a.current_bidder_id.slice(0, 8)}…` : "no bids yet")}
+          </div>
           <div className={`mt-3 font-mono text-2xl ${remainingMs < 30_000 ? "text-danger" : ""}`}>
             {fmtTime(remainingMs)}
           </div>
@@ -102,8 +111,10 @@ export default function AuctionRoom({ params }: { params: { id: string } }) {
           <div className="space-y-1 max-h-64 overflow-auto">
             {(a.bids || []).map((b: any) => (
               <div key={b.id} className="flex justify-between text-xs">
-                <span className="text-zinc-400">{b.bidder_id.slice(0, 8)}…</span>
-                <span className="font-mono">${(Number(b.amount_cents) / 100).toFixed(2)}</span>
+                <span className="text-zinc-400">{b.masked ? "🔒 sealed" : `${b.bidder_id?.slice(0, 8)}…`}</span>
+                <span className="font-mono">
+                  {b.masked ? "???" : `$${(Number(b.amount_cents) / 100).toFixed(2)}`}
+                </span>
                 <span className="text-zinc-500">{new Date(b.placed_at).toLocaleTimeString()}</span>
                 <span className={`text-[10px] uppercase ${b.status === "won" ? "text-success" : b.status === "outbid" ? "text-zinc-500" : ""}`}>{b.status}</span>
               </div>

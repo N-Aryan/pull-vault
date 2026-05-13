@@ -14,15 +14,18 @@ async function main() {
     if (reset) {
       console.log("Dropping all tables…");
       await pool.query(`
-        DROP TABLE IF EXISTS idempotency_keys, platform_revenue, ledger,
+        DROP TABLE IF EXISTS margin_snapshots, wash_trade_flags, rate_limit_events,
+          economics_config, idempotency_keys, platform_revenue, ledger,
           bids, auctions, listings, user_cards, user_packs, pack_drops,
           pack_tiers, card_price_history, cards, users CASCADE;
       `);
     }
 
-    const sql = readFileSync(join(__dirname, "schema.sql"), "utf8");
-    await pool.query(sql);
-    console.log("Schema applied");
+    // Apply Part A schema first, then Part B additive migrations.
+    await pool.query(readFileSync(join(__dirname, "schema.sql"), "utf8"));
+    console.log("Part A schema applied");
+    await pool.query(readFileSync(join(__dirname, "schema-b.sql"), "utf8"));
+    console.log("Part B schema applied");
   } finally {
     await pool.end();
   }

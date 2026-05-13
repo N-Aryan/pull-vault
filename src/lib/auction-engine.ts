@@ -1,6 +1,12 @@
 import { withTxRetry, pool } from "@/lib/db";
 import { applyFeeBps, FEES, minNextBidCents } from "@/lib/money";
 import { pub, Channels } from "@/lib/redis";
+import {
+  validateAmount,
+  checkBidRateLimits,
+  isSealedPhase,
+  IntegrityError,
+} from "@/lib/auction-integrity";
 
 /**
  * Auction Engine
@@ -98,13 +104,21 @@ export async function createAuction(opts: {
  * Returns the new auction state on success.
  */
 export async function placeBid(opts: { userId: string; auctionId: string; amountCents: number }) {
+  // ── B3: Rate-limit before touching DB. Rapid-fire bots get bounced here.
+  await checkBidRateLimits(opts.userId, opts.auctionId);
+
   const result = await withTxRetry(async (client) => {
     // 1. Read current state (no lock — we use optimistic concurrency).
+    //    JOIN the card so we can fat-finger-check against current market price.
     const a = await client.query(
-      `SELECT id, seller_id, current_bid_cents, current_bidder_id, end_time, status,
-              version, snipe_window_seconds, snipe_extend_seconds, start_price_cents,
-              min_increment_cents
-         FROM auctions WHERE id = $1`,
+      `SELECT a.id, a.seller_id, a.current_bid_cents, a.current_bidder_id, a.end_time, a.status,
+              a.version, a.snipe_window_seconds, a.snipe_extend_seconds, a.start_price_cents,
+              a.min_increment_cents, a.sealed_phase_seconds,
+              c.current_price_cents AS market_price_cents
+         FROM auctions a
+         JOIN user_cards uc ON uc.id = a.user_card_id
+         JOIN cards c ON c.id = uc.card_id
+        WHERE a.id = $1`,
       [opts.auctionId],
     );
     if (a.rows.length === 0) throw new AuctionError("AUCTION_NOT_FOUND", "Auction not found");
@@ -115,7 +129,25 @@ export async function placeBid(opts: { userId: string; auctionId: string; amount
     }
     if (au.seller_id === opts.userId) throw new AuctionError("OWN_AUCTION", "You cannot bid on your own auction");
 
-    // 2. Validate the bid amount.
+    // ── B3: SELF-BID prevention. Cannot place a new bid if you ARE the high
+    //    bidder — same rule eBay uses. Prevents shill self-bidding.
+    if (au.current_bidder_id === opts.userId) {
+      throw new IntegrityError("SELF_BID_HIGH", "You're already the high bidder");
+    }
+
+    // ── B3: FAT-FINGER guard. Hard-block bids more than 20× market.
+    const fat = validateAmount(opts.amountCents, Number(au.market_price_cents || 0));
+    if (fat.hardBlock) {
+      // Record the rejected bid for audit.
+      await client.query(
+        `INSERT INTO bids (auction_id, bidder_id, amount_cents, status, rejected_reason)
+         VALUES ($1,$2,$3,'rejected',$4)`,
+        [opts.auctionId, opts.userId, opts.amountCents, fat.warn ?? "fat-finger"],
+      );
+      throw new IntegrityError("FAT_FINGER", fat.warn ?? "Bid blocked");
+    }
+
+    // 2. Validate the bid amount vs current high + increment.
     const currentBid = au.current_bid_cents ? Number(au.current_bid_cents) : null;
     const minNext =
       currentBid === null
@@ -124,6 +156,10 @@ export async function placeBid(opts: { userId: string; auctionId: string; amount
     if (opts.amountCents < minNext) {
       throw new AuctionError("BID_TOO_LOW", `Minimum bid is ${minNext} cents`);
     }
+
+    // ── B3: SEALED PHASE detection — if inside the last N seconds, mark the
+    //    bid as sealed. The pubsub message below masks the amount.
+    const sealed = isSealedPhase(new Date(au.end_time), au.sealed_phase_seconds);
 
     // 3. Place HOLD on the new bidder's funds. Conditional UPDATE — bid fails
     //    cleanly if they don't have enough spendable.
@@ -179,12 +215,12 @@ export async function placeBid(opts: { userId: string; auctionId: string; amount
       throw new AuctionError("VERSION_CONFLICT", "Bid conflicted with another — please retry");
     }
 
-    // 7. Insert audit row.
+    // 7. Insert audit row, marked sealed=true if in sealed phase.
     const bid = await client.query(
-      `INSERT INTO bids (auction_id, bidder_id, amount_cents, status)
-       VALUES ($1, $2, $3, 'active')
+      `INSERT INTO bids (auction_id, bidder_id, amount_cents, status, sealed)
+       VALUES ($1, $2, $3, 'active', $4)
        RETURNING id, placed_at`,
-      [opts.auctionId, opts.userId, opts.amountCents],
+      [opts.auctionId, opts.userId, opts.amountCents, sealed],
     );
 
     return {
@@ -193,24 +229,39 @@ export async function placeBid(opts: { userId: string; auctionId: string; amount
       end_time: upd.rows[0].end_time,
       version: upd.rows[0].version,
       extended: extend,
+      sealed,
       _bid_id: bid.rows[0].id,
     };
   }, "READ COMMITTED");
 
-  // Publish AFTER commit so a retried/failed transaction never publishes a
-  // ghost event that doesn't reflect committed state.
+  // Publish AFTER commit. If sealed, we mask amount and bidder so watchers
+  // know "someone bid" without learning the amount — that's what kills the
+  // sniping advantage.
   pub.publish(
     Channels.auction(opts.auctionId),
-    JSON.stringify({
-      type: "bid",
-      auction_id: opts.auctionId,
-      bid_id: result._bid_id,
-      bidder_id: opts.userId,
-      amount_cents: opts.amountCents,
-      end_time: result.end_time,
-      version: result.version,
-      extended: result.extended,
-    }),
+    JSON.stringify(
+      result.sealed
+        ? {
+            type: "bid",
+            auction_id: opts.auctionId,
+            bid_id: result._bid_id,
+            sealed: true,
+            end_time: result.end_time,
+            version: result.version,
+            extended: result.extended,
+          }
+        : {
+            type: "bid",
+            auction_id: opts.auctionId,
+            bid_id: result._bid_id,
+            sealed: false,
+            bidder_id: opts.userId,
+            amount_cents: opts.amountCents,
+            end_time: result.end_time,
+            version: result.version,
+            extended: result.extended,
+          },
+    ),
   ).catch(() => {});
 
   const { _bid_id, ...rest } = result;
@@ -329,12 +380,20 @@ export async function settleAuction(opts: { auctionId: string }) {
   return result;
 }
 
-/** Auction state for the live room (read path — no transaction needed). */
+/** Auction state for the live room (read path — no transaction needed).
+ *
+ * Sealed-bid masking: while the auction is LIVE and inside the sealed phase,
+ * we hide the amount + bidder_id of any sealed bid AND we hide the
+ * current_bid_cents + current_bidder_id of the auction itself. Watchers see
+ * only "sealed". Once the auction ends, full transparency is restored.
+ */
 export async function getAuctionState(auctionId: string) {
   const { rows } = await pool.query(
     `SELECT a.id, a.seller_id, a.current_bid_cents, a.current_bidder_id,
             a.start_price_cents, a.min_increment_cents, a.snipe_window_seconds,
-            a.snipe_extend_seconds, a.start_time, a.end_time, a.status, a.version,
+            a.snipe_extend_seconds, a.sealed_phase_seconds,
+            a.start_time, a.end_time, a.status, a.version,
+            a.flagged_reason, a.flagged_severity,
             uc.id AS user_card_id,
             c.id AS card_id, c.tcg_id, c.name, c.set_name, c.rarity, c.image_url,
             c.current_price_cents AS market_price_cents
@@ -346,12 +405,33 @@ export async function getAuctionState(auctionId: string) {
   );
   if (rows.length === 0) return null;
   const a = rows[0];
+
   const recent = await pool.query(
-    `SELECT id, bidder_id, amount_cents, placed_at, status
+    `SELECT id, bidder_id, amount_cents, placed_at, status, sealed
        FROM bids WHERE auction_id = $1 ORDER BY placed_at DESC LIMIT 50`,
     [auctionId],
   );
-  return { ...a, bids: recent.rows };
+
+  const remainingMs = new Date(a.end_time).getTime() - Date.now();
+  const inSealedPhase = a.status === "live" && remainingMs > 0
+    && remainingMs <= a.sealed_phase_seconds * 1000;
+
+  if (inSealedPhase) {
+    // Mask the current high bid + bidder. Mask sealed bid rows too.
+    a.current_bid_cents = null;
+    a.current_bidder_id = null;
+    a.in_sealed_phase = true;
+  } else {
+    a.in_sealed_phase = false;
+  }
+
+  const bidsOut = recent.rows.map((b: any) =>
+    b.sealed && inSealedPhase
+      ? { ...b, bidder_id: null, amount_cents: null, masked: true }
+      : { ...b, masked: false },
+  );
+
+  return { ...a, bids: bidsOut };
 }
 
 /** Worker loop: settle any expired auctions. Run on a 5-second tick. */

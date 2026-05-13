@@ -97,6 +97,9 @@ export default function RevealPage({ params }: { params: { id: string } }) {
               View Collection
             </Link>
             <Link href="/packs" className="border border-border px-4 py-2 rounded">More Packs</Link>
+            <Link href={`/verify?id=${params.id}`} className="border border-border px-4 py-2 rounded text-sm">
+              🔐 Verify this pack
+            </Link>
           </div>
         </div>
       )}

@@ -12,6 +12,7 @@
 import "./load-env";
 import { pool } from "../src/lib/db";
 import { settleExpiredAuctions } from "../src/lib/auction-engine";
+import { detectWashTrades } from "../src/lib/auction-integrity";
 import { pub, Channels } from "../src/lib/redis";
 import Decimal from "decimal.js";
 
@@ -86,10 +87,58 @@ async function tickDrops() {
   }
 }
 
+async function tickWashTrades() {
+  try {
+    const r = await detectWashTrades();
+    if (r.flagged > 0) console.log(`[wash] ${r.flagged} new flags`);
+  } catch (e) {
+    console.error("[wash]", e);
+  }
+}
+
+async function tickMarginSnapshot() {
+  // Roll an hourly snapshot per tier into margin_snapshots, used by the
+  // economic-health dashboard. Window = last 60 minutes.
+  try {
+    const cfg = await pool.query(`SELECT target_margin_bps FROM economics_config WHERE id = 1`);
+    const target = Number(cfg.rows[0]?.target_margin_bps ?? 1500);
+
+    await pool.query(
+      `INSERT INTO margin_snapshots
+         (tier_id, window_start, window_end, packs_sold, total_revenue_cents,
+          total_payout_cents, realised_margin_bps, target_margin_bps)
+       SELECT
+         t.id,
+         NOW() - INTERVAL '1 hour',
+         NOW(),
+         COUNT(up.id)::int,
+         COALESCE(SUM(up.price_paid),0)::bigint,
+         COALESCE(SUM((SELECT SUM((e->>'price_cents_at_pull')::bigint)
+                        FROM jsonb_array_elements(up.contents_json) e)),0)::bigint,
+         CASE WHEN COALESCE(SUM(up.price_paid),0) > 0
+              THEN (SUM(up.price_paid) - COALESCE(SUM((SELECT SUM((e->>'price_cents_at_pull')::bigint)
+                                                      FROM jsonb_array_elements(up.contents_json) e)),0))::numeric
+                   / SUM(up.price_paid) * 10000
+              ELSE NULL END,
+         $1
+       FROM pack_tiers t
+       LEFT JOIN user_packs up ON up.tier_id = t.id
+            AND up.purchased_at >= NOW() - INTERVAL '1 hour'
+       GROUP BY t.id`,
+      [target],
+    );
+  } catch (e) {
+    console.error("[margin]", e);
+  }
+}
+
 setInterval(tickAuctions, 3_000);
 setInterval(tickPrices, 30_000);
 setInterval(tickDrops, 10_000);
+setInterval(tickWashTrades, 5 * 60_000);   // every 5 minutes
+setInterval(tickMarginSnapshot, 60 * 60_000); // hourly
 
 // Run once on boot too
 tickDrops();
 tickPrices();
+tickMarginSnapshot();

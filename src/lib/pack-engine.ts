@@ -2,6 +2,12 @@ import Decimal from "decimal.js";
 import { withTxRetry } from "@/lib/db";
 import { pub, Channels } from "@/lib/redis";
 import { PoolClient } from "pg";
+import {
+  generateServerSeed,
+  rollSlot,
+  pickWeighted,
+  cardPoolHash,
+} from "@/lib/provably-fair";
 
 /**
  * Pack Engine
@@ -45,72 +51,73 @@ export class PackError extends Error {
   }
 }
 
-/** Weighted random pick over a rarity-weights map. Decimal-safe. */
-function pickRarity(weights: RarityWeights): string {
-  const keys = Object.keys(weights);
-  const total = keys.reduce((a, k) => a + weights[k], 0);
-  let r = Math.random() * total;
-  for (const k of keys) {
-    r -= weights[k];
-    if (r <= 0) return k;
-  }
-  return keys[keys.length - 1];
-}
-
 /**
- * Roll pack contents from the catalog. Picks a rarity per slot, then picks a
- * random card from that rarity bucket (via TABLESAMPLE / ORDER BY random()).
+ * Roll pack contents from a SNAPSHOT of the card pool using a deterministic
+ * HMAC-driven stream. The card pool is hashed (card_pool_hash) so that the
+ * exact set of cards eligible for selection at this purchase moment is
+ * provably committed — the server can't "swap in" a worse card later.
  *
- * For pack tiers above the "starter" tier we guarantee at least one rare-or-
- * better slot — this is a common feel-good pull system in the real industry
- * and keeps the EV math from being feast-or-famine.
+ * Returns contents + the pool snapshot hash (for storage in user_packs).
  */
-async function rollPack(
+async function rollPackProvablyFair(
   client: PoolClient,
   weights: RarityWeights,
   slots: number,
   guaranteedRareOrBetter: boolean,
-): Promise<PackContents> {
-  const rarities = Array.from({ length: slots }, () => pickRarity(weights));
+  seed: { server_seed: string; client_seed: string; nonce: number },
+): Promise<{ contents: PackContents; pool_hash: string; pool: Record<string, any[]> }> {
+  // 1. Read the entire pool of cards keyed by rarity, deterministically
+  //    ordered by id so the same pool yields the same indices on replay.
+  const all = await client.query(
+    `SELECT id, tcg_id, name, set_name, rarity, image_url, current_price_cents
+       FROM cards ORDER BY id`,
+  );
+  if (all.rows.length === 0) throw new Error("Card catalog is empty — run npm run db:seed");
+  const byRarity: Record<string, any[]> = {};
+  for (const r of all.rows) (byRarity[r.rarity] ??= []).push(r);
+
+  const idsByRarity: Record<string, string[]> = {};
+  for (const k of Object.keys(byRarity)) idsByRarity[k] = byRarity[k].map((c) => c.id);
+  const pool_hash = cardPoolHash(idsByRarity);
+
+  // 2. Roll each slot using the HMAC stream.
+  const rarityKeys = Object.keys(weights);
+  const out: PackContents = [];
+  const rarities: string[] = [];
+  for (let s = 0; s < slots; s++) {
+    const { u_rarity, u_card } = rollSlot(seed.server_seed, seed.client_seed, seed.nonce, s);
+    let chosen = pickWeighted(weights as any, rarityKeys as any, u_rarity);
+    // If the chosen rarity bucket is empty, fall through to "common".
+    if (!byRarity[chosen] || byRarity[chosen].length === 0) chosen = "common";
+    rarities.push(chosen);
+    const bucket = byRarity[chosen] ?? byRarity["common"];
+    const idx = Math.min(bucket.length - 1, Math.floor(u_card * bucket.length));
+    const c = bucket[idx];
+    out.push({
+      card_id: c.id, tcg_id: c.tcg_id, name: c.name, set_name: c.set_name,
+      rarity: c.rarity, image_url: c.image_url, price_cents_at_pull: Number(c.current_price_cents),
+    });
+  }
+
+  // 3. Guarantee logic — uses an EXTRA deterministic roll so we can replay it.
+  //    If guarantee is required and no slot rolled rare-or-better, we use
+  //    HMAC slot index = slots (one past the last real slot) to pick which
+  //    slot to upgrade. This is fully deterministic and verifiable.
   if (guaranteedRareOrBetter) {
     const isRareOrBetter = (r: string) => r === "rare" || r === "holo" || r === "ultra" || r === "secret";
-    if (!rarities.some(isRareOrBetter)) {
-      // Upgrade the last slot from common/uncommon to rare. Cheapest "guarantee".
-      rarities[rarities.length - 1] = "rare";
-    }
-  }
-  const out: PackContents = [];
-  for (const rarity of rarities) {
-    // ORDER BY random() is fine at our card-table scale (< 50k rows). For a
-    // real prod system at 1M+ rows we'd use TABLESAMPLE SYSTEM_ROWS or pre-
-    // shuffled materialised views.
-    const { rows } = await client.query(
-      `SELECT id, tcg_id, name, set_name, rarity, image_url, current_price_cents
-         FROM cards WHERE rarity = $1 ORDER BY random() LIMIT 1`,
-      [rarity],
-    );
-    if (rows.length === 0) {
-      // No card in that rarity bucket — degrade to common so the pack always
-      // has the right number of cards.
-      const fb = await client.query(
-        `SELECT id, tcg_id, name, set_name, rarity, image_url, current_price_cents
-           FROM cards WHERE rarity = 'common' ORDER BY random() LIMIT 1`,
-      );
-      if (fb.rows.length === 0) throw new Error("Card catalog is empty — run npm run db:seed");
-      const c = fb.rows[0];
-      out.push({
+    if (!out.some((c) => isRareOrBetter(c.rarity))) {
+      const { u_rarity: u_pick, u_card } = rollSlot(seed.server_seed, seed.client_seed, seed.nonce, slots);
+      const upgradeIdx = Math.min(slots - 1, Math.floor(u_pick * slots));
+      const bucket = byRarity["rare"] ?? byRarity["common"];
+      const cardIdx = Math.min(bucket.length - 1, Math.floor(u_card * bucket.length));
+      const c = bucket[cardIdx];
+      out[upgradeIdx] = {
         card_id: c.id, tcg_id: c.tcg_id, name: c.name, set_name: c.set_name,
         rarity: c.rarity, image_url: c.image_url, price_cents_at_pull: Number(c.current_price_cents),
-      });
-    } else {
-      const c = rows[0];
-      out.push({
-        card_id: c.id, tcg_id: c.tcg_id, name: c.name, set_name: c.set_name,
-        rarity: c.rarity, image_url: c.image_url, price_cents_at_pull: Number(c.current_price_cents),
-      });
+      };
     }
   }
-  return out;
+  return { contents: out, pool_hash, pool: byRarity };
 }
 
 /**
@@ -123,7 +130,20 @@ async function rollPack(
  *   - Exactly one of: (success path executes both UPDATEs, INSERT, ledger row)
  *     or (rollback, no rows changed at all)
  */
-export async function buyPack(opts: { userId: string; dropId: string }) {
+export async function buyPack(opts: {
+  userId: string;
+  dropId: string;
+  /** Optional client-supplied entropy. If omitted we generate one. */
+  clientSeed?: string;
+}) {
+  // Generate the server seed OUTSIDE the transaction so retries (40001) don't
+  // generate a new commit each time. The commit is locked the moment the buy
+  // succeeds — that's the cryptographic guarantee.
+  const { server_seed, commit_hash } = generateServerSeed();
+  const clientSeed = opts.clientSeed && opts.clientSeed.length > 0
+    ? opts.clientSeed.slice(0, 64)
+    : require("node:crypto").randomBytes(16).toString("hex");
+
   const result = await withTxRetry(async (client) => {
     // 1. Fetch the drop + tier in one shot, without any lock — we only need it
     //    for the price + weights. The conditional UPDATE below is the actual
@@ -156,30 +176,48 @@ export async function buyPack(opts: { userId: string; dropId: string }) {
     if (decQ.rowCount === 0) throw new PackError("SOLD_OUT", "Sold out");
     const { sold_count, total_inventory, status: newStatus } = decQ.rows[0];
 
-    // 3. Debit balance atomically — only succeeds if balance_available >= price.
+    // 3. Debit balance atomically AND bump the user's pack nonce (one stmt).
+    //    The nonce is part of the HMAC input so each pack a user buys has a
+    //    unique deterministic stream — protects against replay/copy attacks.
     const debitQ = await client.query(
       `UPDATE users
-          SET balance_available = balance_available - $2
+          SET balance_available = balance_available - $2,
+              pack_nonce = pack_nonce + 1,
+              last_request_ip = COALESCE($3, last_request_ip),
+              last_user_agent = COALESCE($4, last_user_agent)
         WHERE id = $1 AND balance_available >= $2
-        RETURNING balance_available`,
-      [opts.userId, drop.price_cents],
+        RETURNING balance_available, pack_nonce`,
+      [opts.userId, drop.price_cents, null, null],
     );
     if (debitQ.rowCount === 0) throw new PackError("INSUFFICIENT_FUNDS", "Insufficient funds");
+    const nonce = Number(debitQ.rows[0].pack_nonce);
 
-    // 4. Roll contents server-side — the user can never influence the result.
-    const contents = await rollPack(
+    // 4. Roll contents using the provably-fair HMAC stream. The weights
+    //    snapshot is the EXACT vector used — recorded so the user can replay.
+    const rolled = await rollPackProvablyFair(
       client,
       drop.rarity_weights,
       drop.cards_per_pack,
-      drop.slug !== "starter", // starter has no guarantee; everything else does
+      drop.slug !== "starter",
+      { server_seed, client_seed: clientSeed, nonce },
     );
+    const contents = rolled.contents;
 
-    // 5. Insert the user_pack record.
+    // 5. Insert the user_pack record with the commit hash, weights snapshot
+    //    and pool hash. server_seed is stored too — it stays SECRET until
+    //    reveal time (the reveal endpoint is what exposes it).
     const upQ = await client.query(
-      `INSERT INTO user_packs (user_id, drop_id, tier_id, price_paid, contents_json)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, purchased_at`,
-      [opts.userId, opts.dropId, drop.tier_id, drop.price_cents, JSON.stringify(contents)],
+      `INSERT INTO user_packs (
+         user_id, drop_id, tier_id, price_paid, contents_json,
+         server_seed_hash, server_seed, client_seed, nonce,
+         weights_snapshot, card_pool_hash
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING id, purchased_at, server_seed_hash`,
+      [
+        opts.userId, opts.dropId, drop.tier_id, drop.price_cents, JSON.stringify(contents),
+        commit_hash, server_seed, clientSeed, nonce,
+        JSON.stringify(drop.rarity_weights), rolled.pool_hash,
+      ],
     );
 
     // 6. Ledger entry + platform revenue (margin = price - sum of card values)
@@ -203,7 +241,11 @@ export async function buyPack(opts: { userId: string; dropId: string }) {
       price_paid: Number(drop.price_cents),
       ev_cents: evCents,
       margin_cents: margin,
-      // for the post-commit publish (pulled out of the closure)
+      // Provably-fair: only the commit is public at this stage.
+      commit_hash,
+      client_seed: clientSeed,
+      nonce,
+      // for the post-commit publish
       _drop_id: opts.dropId,
       _sold_count: sold_count,
       _total_inventory: total_inventory,
@@ -239,18 +281,31 @@ export async function buyPack(opts: { userId: string; dropId: string }) {
 export async function revealPack(opts: { userId: string; userPackId: string }) {
   return withTxRetry(async (client) => {
     const r = await client.query(
-      `SELECT id, user_id, contents_json, revealed_at FROM user_packs
-        WHERE id = $1 AND user_id = $2`,
+      `SELECT id, user_id, contents_json, revealed_at,
+              server_seed, server_seed_hash, client_seed, nonce,
+              weights_snapshot, card_pool_hash
+         FROM user_packs WHERE id = $1 AND user_id = $2`,
       [opts.userPackId, opts.userId],
     );
     if (r.rows.length === 0) throw new Error("Pack not found");
     const pack = r.rows[0];
-    if (pack.revealed_at) return { id: pack.id, contents: pack.contents_json, alreadyRevealed: true };
 
-    // Mark revealed
+    // Provably-fair: revealing exposes server_seed so the user can verify.
+    const proof = {
+      server_seed: pack.server_seed,
+      server_seed_hash: pack.server_seed_hash,
+      client_seed: pack.client_seed,
+      nonce: pack.nonce ? Number(pack.nonce) : null,
+      weights_snapshot: pack.weights_snapshot,
+      card_pool_hash: pack.card_pool_hash,
+    };
+
+    if (pack.revealed_at) {
+      return { id: pack.id, contents: pack.contents_json, alreadyRevealed: true, proof };
+    }
+
     await client.query(`UPDATE user_packs SET revealed_at = NOW() WHERE id = $1`, [pack.id]);
 
-    // Materialise each card into user_cards (so trade/auction can reference it)
     const contents = pack.contents_json as PackContents;
     for (const c of contents) {
       await client.query(
@@ -259,7 +314,7 @@ export async function revealPack(opts: { userId: string; userPackId: string }) {
         [opts.userId, c.card_id, c.price_cents_at_pull],
       );
     }
-    return { id: pack.id, contents, alreadyRevealed: false };
+    return { id: pack.id, contents, alreadyRevealed: false, proof };
   }, "READ COMMITTED");
 }
 

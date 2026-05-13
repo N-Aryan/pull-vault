@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { z } from "zod";
 import { placeBid, AuctionError } from "@/lib/auction-engine";
+import { IntegrityError } from "@/lib/auction-integrity";
 import { ok, fail, requireUser } from "@/lib/api-helpers";
 
 const Body = z.object({ amount_cents: z.number().int().positive() });
@@ -20,6 +21,13 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
         e.code === "INSUFFICIENT_FUNDS" ? 402 :
         e.code === "AUCTION_ENDED" ? 410 :
         e.code === "VERSION_CONFLICT" ? 409 : 400;
+      return fail(e.message, status);
+    }
+    if (e instanceof IntegrityError) {
+      const status =
+        e.code === "FAT_FINGER" ? 422 :
+        e.code === "RAPID_FIRE" ? 429 :
+        e.code === "SELF_BID_HIGH" ? 409 : 400;
       return fail(e.message, status);
     }
     console.error(e);
